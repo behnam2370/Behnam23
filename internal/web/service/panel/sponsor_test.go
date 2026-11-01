@@ -2,11 +2,11 @@ package panel
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,7 +22,7 @@ func validSponsor() Sponsor {
 	return Sponsor{
 		ID:    "acme",
 		Name:  "Acme",
-		Slots: []string{"dashboard", "sidebar"},
+		Slots: []string{"dashboard"},
 		Until: sponsorTestNow.Add(24 * time.Hour),
 		Logo:  "acme.png",
 		Link:  "https://acme.example/",
@@ -59,34 +59,6 @@ func TestActiveSponsorsFilters(t *testing.T) {
 	}
 }
 
-func TestActiveSponsorsCapsSidebarAtThree(t *testing.T) {
-	raw := &SponsorList{}
-	for _, id := range []string{"expired", "a", "b", "c", "d", "e"} {
-		sp := validSponsor()
-		sp.ID = id
-		sp.Slots = []string{"sidebar", "page"}
-		if id == "expired" {
-			sp.Until = sponsorTestNow
-		}
-		if id == "e" {
-			sp.Slots = []string{"sidebar"}
-		}
-		raw.Sponsors = append(raw.Sponsors, sp)
-	}
-	got := activeSponsors(raw, sponsorTestNow)
-	want := map[string][]string{
-		"a": {"sidebar", "page"}, "b": {"sidebar", "page"}, "c": {"sidebar", "page"}, "d": {"page"},
-	}
-	if len(got.Sponsors) != len(want) {
-		t.Fatalf("got %d sponsors, want %d (e has only sidebar and must drop)", len(got.Sponsors), len(want))
-	}
-	for _, sp := range got.Sponsors {
-		if !slices.Equal(sp.Slots, want[sp.ID]) {
-			t.Errorf("%s slots = %v, want %v", sp.ID, sp.Slots, want[sp.ID])
-		}
-	}
-}
-
 func TestActiveSponsorsLogoName(t *testing.T) {
 	cases := []struct{ logo, want string }{
 		{"acme.png", "/sponsors/logo/acme.png"},
@@ -114,7 +86,7 @@ func TestActiveSponsorsLogoName(t *testing.T) {
 
 func TestActiveSponsorsResolvesLogoAndSlots(t *testing.T) {
 	sp := validSponsor()
-	sp.Slots = []string{"subpage", "login"}
+	sp.Slots = []string{"subpage", "sidebar", "login"}
 	got := activeSponsors(&SponsorList{Contact: "javascript:x", Sponsors: []Sponsor{sp}}, sponsorTestNow)
 	if len(got.Sponsors) != 1 {
 		t.Fatalf("got %d sponsors, want 1", len(got.Sponsors))
@@ -141,6 +113,10 @@ func setupSponsorServer(t *testing.T, body string) *atomic.Int32 {
 		isLogo := strings.HasPrefix(r.URL.Path, "/media/")
 		if (isLogo && failSponsorLogos.Load()) || (!isLogo && failSponsorList.Load()) {
 			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/media/many") {
+			_, _ = w.Write(pngMagic)
 			return
 		}
 		switch r.URL.Path {
@@ -260,6 +236,40 @@ func TestGetSponsorLogo(t *testing.T) {
 	_, _, err = svc.GetSponsorLogo("fake.png")
 	if want := "sponsor logo fake.png has content type text/plain; charset=utf-8"; err == nil || err.Error() != want {
 		t.Errorf("fake.png: err = %v, want %q", err, want)
+	}
+}
+
+// The feed decides which logo names exist, so it must not decide how many the panel holds in memory.
+func TestSponsorLogoCacheStaysBounded(t *testing.T) {
+	var list []string
+	for i := range 3 * maxSponsorLogos {
+		until := "2099-01-01T00:00:00Z"
+		if i < maxSponsorLogos {
+			until = sponsorTestNow.Add(time.Minute).Format(time.RFC3339)
+		}
+		list = append(list, fmt.Sprintf(`{"id":"s%d","slots":["page"],"until":%q,
+			"link":"https://s.example/","logo":"many%d.png"}`, i, until, i))
+	}
+	setupSponsorServer(t, `{"sponsors":[`+strings.Join(list, ",")+`]}`)
+	now := sponsorTestNow
+	sponsorNow = func() time.Time { return now }
+	svc := &PanelService{}
+
+	got, err := svc.GetSponsors()
+	if err != nil || len(got.Sponsors) != 3*maxSponsorLogos {
+		t.Fatalf("GetSponsors() = %d sponsors, %v; want all %d kept (only surplus logos drop)", len(got.Sponsors), err, 3*maxSponsorLogos)
+	}
+	for _, step := range []string{"full list", "first sponsors expired"} {
+		served := 0
+		for i := range 3 * maxSponsorLogos {
+			if _, _, err := svc.GetSponsorLogo(fmt.Sprintf("many%d.png", i)); err == nil {
+				served++
+			}
+		}
+		if served != maxSponsorLogos || len(logos) != maxSponsorLogos {
+			t.Errorf("%s: served %d logos, cache holds %d, want %d for both", step, served, len(logos), maxSponsorLogos)
+		}
+		now = now.Add(2 * time.Minute)
 	}
 }
 

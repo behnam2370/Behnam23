@@ -19,6 +19,7 @@ import (
 
 	"github.com/mhsanaei/3x-ui/v3/internal/config"
 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/version"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/global"
 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
 )
@@ -42,6 +43,7 @@ type PanelUpdateInfo struct {
 const (
 	panelUpdaterURL      = "https://raw.githubusercontent.com/MHSanaei/3x-ui/main/update.sh"
 	maxPanelUpdaterBytes = 2 << 20
+	maxPanelReleaseBytes = 2 << 20
 	// devReleaseTag is the fixed-tag rolling pre-release the CI force-moves to the
 	// newest main commit; the dev update channel installs from it.
 	devReleaseTag = "dev-latest"
@@ -449,7 +451,7 @@ func fetchPanelRelease(tag string) (*service.Release, error) {
 	}
 
 	var release service.Release
-	if err := json.NewDecoder(resp.Body).Decode(&release); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxPanelReleaseBytes)).Decode(&release); err != nil {
 		return nil, err
 	}
 	return &release, nil
@@ -522,48 +524,11 @@ func resolveUpdateFolders() (string, string) {
 }
 
 func isNewerVersion(latest string, current string) bool {
-	cmp, ok := compareVersionStrings(latest, current)
+	cmp, ok := version.Compare(latest, current)
 	if !ok {
-		return normalizeVersionTag(latest) != normalizeVersionTag(current)
+		return version.Normalize(latest) != version.Normalize(current)
 	}
 	return cmp > 0
-}
-
-func compareVersionStrings(a string, b string) (int, bool) {
-	aParts, okA := parseVersionParts(a)
-	bParts, okB := parseVersionParts(b)
-	if !okA || !okB {
-		return 0, false
-	}
-	for i := range len(aParts) {
-		if aParts[i] > bParts[i] {
-			return 1, true
-		}
-		if aParts[i] < bParts[i] {
-			return -1, true
-		}
-	}
-	return 0, true
-}
-
-func parseVersionParts(version string) ([3]int, bool) {
-	var result [3]int
-	parts := strings.Split(normalizeVersionTag(version), ".")
-	if len(parts) != 3 {
-		return result, false
-	}
-	for i, part := range parts {
-		n, err := strconv.Atoi(part)
-		if err != nil {
-			return result, false
-		}
-		result[i] = n
-	}
-	return result, true
-}
-
-func normalizeVersionTag(version string) string {
-	return strings.TrimPrefix(strings.TrimSpace(version), "v")
 }
 
 func shellQuote(value string) string {

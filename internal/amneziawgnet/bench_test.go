@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	awgconn "github.com/amnezia-vpn/amneziawg-go/v3/conn"
 	"github.com/amnezia-vpn/amneziawg-go/v3/device"
 	"github.com/amnezia-vpn/amneziawg-go/v3/tun/netstack"
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -135,7 +134,7 @@ func newBenchTunnel(b *testing.B, listenPort int, serverAddr, clientAddr string)
 	if err != nil {
 		b.Fatalf("newUnconfiguredDevice: %v", err)
 	}
-	AttachTCPForwarder(dev.Stack, func(conn *gonet.TCPConn, dest netip.AddrPort) {
+	AttachTCPForwarder(dev.Stack, ownerBySource, func(conn *gonet.TCPConn, _, dest netip.AddrPort) {
 		defer conn.Close()
 		switch dest.Port() {
 		case benchDiscardPort:
@@ -159,7 +158,7 @@ func newBenchTunnel(b *testing.B, listenPort int, serverAddr, clientAddr string)
 	if err != nil {
 		b.Fatalf("client CreateNetTUN: %v", err)
 	}
-	clientDev := device.NewDevice(clientTun, awgconn.NewDefaultBind(), device.NewLogger(device.LogLevelSilent, ""))
+	clientDev := device.NewDevice(clientTun, newListenBind(""), device.NewLogger(device.LogLevelSilent, ""))
 
 	clientPrivHex, err := wireguard.KeyToHex(clientPriv)
 	if err != nil {
@@ -211,7 +210,7 @@ func (t *benchTunnel) dial(b *testing.B, dest netip.AddrPort) *gonet.TCPConn {
 func BenchmarkTunnelThroughput(b *testing.B) {
 	const chunkSize = 64 << 10
 	const serverAddr = "10.203.0.1"
-	tun := newBenchTunnel(b, 58714, serverAddr, "10.203.0.2")
+	tun := newBenchTunnel(b, freeUDPPort(b), serverAddr, "10.203.0.2")
 	defer tun.closeFn()
 
 	b.Run("upload", func(b *testing.B) {

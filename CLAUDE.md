@@ -63,7 +63,7 @@ file locations when it can answer in one hop.
     CPU/memory watchdogs, …); full table in `docs/architecture.md` §5.4.
   - `middleware/`, `entity/`, `global/`, `session/` (CSRF), `network/`,
     `runtime/` (master/sub-node over mTLS), `websocket/`.
-  - `locale/` + `translation/` — i18n, 13 embedded locale JSON files.
+  - `locale/` + `translation/` — i18n, 14 embedded locale JSON files.
 - `frontend/` — React + TS source (see `frontend/CLAUDE.md`).
 - `tools/openapigen/` — Go generator that emits frontend types + Zod/JSON schemas
   into `frontend/src/generated/` from Go structs. The OpenAPI doc itself
@@ -102,12 +102,13 @@ file locations when it can answer in one hop.
   never hand-write them. A new struct must be added to openapigen's `StructAllow`
   allowlist (`tools/openapigen/main.go`) or it is silently omitted from
   schemas/examples (and `build-openapi.mjs` then fails on the missing schema).
-- A new or renamed endpoint has a FOURTH step nothing checks: copy
+- A new or renamed endpoint has a FOURTH step: copy
   `frontend/public/openapi.json` → `docs/public/openapi.json`, then
   `cd docs && pnpm gen:api` to refresh the MDX under
-  `docs/content/docs/en/reference/api/`. `docs-ci.yml` fires only on `docs/**`.
+  `docs/content/docs/en/reference/api/`. The `codegen` job and `make verify`
+  fail on a stale copy, and `docs-ci.yml` fails on stale MDX.
 - A new English i18n key goes in EVERY locale JSON in `internal/web/translation/`
-  (13 files) AND must be referenced from `frontend/src` or Go in the SAME commit —
+  (14 files) AND must be referenced from `frontend/src` or Go in the SAME commit —
   `frontend/src/test/i18n-dead-keys.test.ts` fails both ways. It is a frontend
   test, so run `npm test`, not just `make test-go`. At runtime the frontend falls
   back to en-US; Go (`internal/web/locale/`) returns "" for an unknown key.
@@ -160,9 +161,10 @@ file locations when it can answer in one hop.
   `-race`); `httptest` for HTTP. Keep `database.InitDB` for reopening a file or
   migrating a hand-built legacy DB. `internal/sub`'s `initSubDB(t)` is the template.
 - Code must pass `golangci-lint run` (gofumpt + goimports formatting): `make lint`.
-- Postgres, xray-gRPC-e2e and scale tests `t.Skip` unless `XUI_TEST_PG_DSN`,
-  `XUI_DB_TYPE`+`XUI_DB_DSN`, `XRAY_E2E_BINARY` or `XUI_SCALE_TEST` is set — a
-  green `go test ./...` does not mean those paths ran.
+- Postgres, xray-gRPC-e2e, master+node and scale tests `t.Skip` unless
+  `XUI_TEST_PG_DSN`, `XUI_DB_TYPE`+`XUI_DB_DSN`, `XRAY_E2E_BINARY`,
+  `XUI_NODE_E2E_BINARY` or `XUI_SCALE_TEST` is set — a green `go test ./...`
+  does not mean those paths ran.
 
 ## Frontend conventions (summary; full version in frontend/CLAUDE.md)
 - Ant Design 6 only — no Tailwind/shadcn. Targeted tweaks, not rewrites.
@@ -188,12 +190,16 @@ reads as a broken repo, not a missing step. Run `make dist-stub` once; every
 `make` Go target already depends on it, which is why `make test-go` beats
 `go test ./...`. Run `make help` for all targets. The local gate:
 
-    make verify   # gen-check + lint + typecheck + test + build + build-storybook
+    make verify   # gen-check + lint + typecheck + test + build + build-storybook + docs-openapi-check
 
 That is the *fast* gate, not all of CI. `ci.yml` also runs `make race`,
-`make vulncheck`, a live-Postgres job (where a SKIP counts as a failure) and a
+`make vulncheck`, a live-Postgres job (where a SKIP counts as a failure),
+`make node-e2e` (a real master and node panel, `internal/nodee2e/`) and a
 30s fuzz smoke on `FuzzParseLink`/`FuzzDecodeCertPin` — run those locally when
-you touch DB/dialect or parser code.
+you touch DB/dialect, node sync or parser code. Node sync has two layers: every
+`runtime.Remote` call gets a cell in `internal/web/node_contract_test.go` (fast,
+in `make test-go`; a method without one fails it), and a multi-tick flow (cron,
+adopt, node down) gets one in `internal/nodee2e/node_sync_test.go`.
 
 Common targets: `make gen` (regenerate Zod/OpenAPI), `make lint` (Go + frontend),
 `make test` (Go `-shuffle=on` + frontend), `make race`, `make build`. See `Makefile`.

@@ -3,6 +3,7 @@ package service
 import (
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database/dbtest"
 )
@@ -14,7 +15,9 @@ func TestCurrentStatusSamplesBeforeFirstTick(t *testing.T) {
 	t.Setenv("XUI_DB_FOLDER", dbDir)
 	dbtest.InitDB(t, filepath.Join(dbDir, "x-ui.db"))
 
-	svc := &ServerService{}
+	// A settled IP cache keeps GetStatus from starting a public-IP resolver that
+	// outlives this test and races http.DefaultTransport in later ones.
+	svc := &ServerService{cachedIPv4: "192.0.2.1", cachedIPv6: "N/A", nextIPv4Lookup: time.Now().Add(time.Hour), nextIPv6Lookup: time.Now().Add(time.Hour)}
 	if svc.LastStatus() != nil {
 		t.Fatal("a fresh ServerService should hold no snapshot yet")
 	}

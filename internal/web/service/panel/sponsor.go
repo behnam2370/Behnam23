@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -45,7 +46,7 @@ const (
 	sponsorsErrTTL   = 10 * time.Minute
 	maxSponsorsBytes = 256 << 10
 	maxLogoBytes     = 256 << 10
-	maxSidebarSlots  = 3
+	maxSponsorLogos  = 32
 	localSponsorsDir = "../sponsors/3X"
 	sponsorLogoPath  = "/sponsors/logo/"
 )
@@ -61,13 +62,13 @@ type sponsorLogo struct {
 }
 
 var (
-	sponsorsURL     = "https://sponsors.sanaei.dev/3X/sponsors.json"
-	sponsorLogoBase = "https://sponsors.sanaei.dev/3X/logos/"
+	sponsorsURL     = "https://raw.githubusercontent.com/MHSanaei/sponsors/refs/heads/main/3X/sponsors.json"
+	sponsorLogoBase = "https://raw.githubusercontent.com/MHSanaei/sponsors/refs/heads/main/3X/logos/"
 	sponsorNow      = time.Now
 
 	// The panel proxies logos from sponsorLogoBase: CSP stays 'self' and no third party sees admin IPs.
 	sponsorLogoRe = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]*\.(png|webp|jpg)$`)
-	sponsorSlots  = map[string]bool{"dashboard": true, "sidebar": true, "page": true, "login": true}
+	sponsorSlots  = map[string]bool{"dashboard": true, "page": true, "login": true}
 
 	sponsorsMu      sync.Mutex
 	sponsorsRaw     *SponsorList
@@ -119,7 +120,7 @@ func (s *PanelService) GetSponsorLogo(name string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	if !slices.ContainsFunc(sponsors.Sponsors, func(sp Sponsor) bool { return sp.Logo == sponsorLogoPath+name }) {
+	if !sponsors.hasLogo(name) {
 		return nil, "", ErrSponsorLogoUnknown
 	}
 	logosMu.Lock()
@@ -139,8 +140,14 @@ func (s *PanelService) GetSponsorLogo(name string) ([]byte, string, error) {
 	default:
 		l = sponsorLogo{err: err, retryAt: now.Add(sponsorsErrTTL)}
 	}
+	// Logos that left the active list go with every store, so the cache never outgrows maxSponsorLogos.
+	maps.DeleteFunc(logos, func(cached string, _ sponsorLogo) bool { return !sponsors.hasLogo(cached) })
 	logos[name] = l
 	return l.data, l.contentType, l.err
+}
+
+func (list *SponsorList) hasLogo(name string) bool {
+	return slices.ContainsFunc(list.Sponsors, func(sp Sponsor) bool { return sp.Logo == sponsorLogoPath+name })
 }
 
 func fetchSponsorLogo(name string) ([]byte, string, error) {
@@ -217,7 +224,7 @@ func activeSponsors(raw *SponsorList, now time.Time) *SponsorList {
 	if strings.HasPrefix(raw.Contact, "https://") {
 		out.Contact = raw.Contact
 	}
-	sidebarTaken := 0
+	logoNames := map[string]bool{}
 	for _, sp := range raw.Sponsors {
 		// A missing enable counts as on, so a forgotten field never hides a paid slot.
 		disabled := sp.Enable != nil && !*sp.Enable
@@ -225,25 +232,22 @@ func activeSponsors(raw *SponsorList, now time.Time) *SponsorList {
 		if disabled || notStarted || sp.ID == "" || !now.Before(sp.Until) || !strings.HasPrefix(sp.Link, "https://") {
 			continue
 		}
-		// A bad logo name drops only the logo; the paid slot still renders with its initial.
-		if sponsorLogoRe.MatchString(sp.Logo) {
-			sp.Logo = sponsorLogoPath + sp.Logo
-		} else {
-			sp.Logo = ""
-		}
 		slots := make([]string, 0, len(sp.Slots))
 		for _, slot := range sp.Slots {
-			// The sidebar rotates, so capping it keeps each paid card on screen long enough.
-			if !sponsorSlots[slot] || (slot == "sidebar" && sidebarTaken >= maxSidebarSlots) {
-				continue
+			if sponsorSlots[slot] {
+				slots = append(slots, slot)
 			}
-			slots = append(slots, slot)
 		}
 		if len(slots) == 0 {
 			continue
 		}
-		if slices.Contains(slots, "sidebar") {
-			sidebarTaken++
+		// A bad or surplus logo name drops only the logo; the paid slot renders with its initial.
+		// Every name kept here becomes one cached image, so the list must not decide how many.
+		if sponsorLogoRe.MatchString(sp.Logo) && (logoNames[sp.Logo] || len(logoNames) < maxSponsorLogos) {
+			logoNames[sp.Logo] = true
+			sp.Logo = sponsorLogoPath + sp.Logo
+		} else {
+			sp.Logo = ""
 		}
 		sp.Slots = slots
 		out.Sponsors = append(out.Sponsors, sp)

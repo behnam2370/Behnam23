@@ -28,6 +28,7 @@ export default function HappSettingsContent({
   remoteSourceBadge,
 }: HappSettingsContentProps) {
   const { t } = useTranslation();
+  const [messageApi, messageContextHolder] = message.useMessage();
   // Generator choices stay local until Apply updates the draft; page Save persists it.
   const [selectedPreset, setSelectedPreset] = useState<string>('iran-bypass');
   const [includeAdblock, setIncludeAdblock] = useState(false);
@@ -37,18 +38,19 @@ export default function HappSettingsContent({
     const payload = buildHappPresetDeeplink(selectedPreset, includeAdblock);
     if (payload) {
       updateSetting({ subRoutingRules: payload });
-      message.success(t('pages.settings.subHappPresetApplied'));
+      messageApi.success(t('pages.settings.subHappPresetApplied'));
     }
   };
 
   const handleBuildDeeplink = (deeplink: string) => {
     updateSetting({ subRoutingRules: deeplink });
     setIsModalOpen(false);
-    message.success(t('pages.settings.subHappDeeplinkGenerated'));
+    messageApi.success(t('pages.settings.subHappDeeplinkGenerated'));
   };
 
   return (
     <>
+      {messageContextHolder}
       <SettingListItem
         paddings="small"
         title={t('pages.settings.subHappAutoDetect')}
@@ -78,7 +80,7 @@ export default function HappSettingsContent({
           {
             key: 'routing',
             label: catTabLabel(
-              <BranchesOutlined />,
+              <BranchesOutlined aria-hidden />,
               t('pages.settings.subHappGroupRouting'),
               isMobile,
             ),
@@ -134,7 +136,7 @@ export default function HappSettingsContent({
                   title={t('pages.settings.subHappVisualBuilder')}
                   description={t('pages.settings.subHappVisualBuilderDesc')}
                 >
-                  <Button icon={<BuildOutlined />} onClick={() => setIsModalOpen(true)}>
+                  <Button icon={<BuildOutlined aria-hidden />} onClick={() => setIsModalOpen(true)}>
                     {t('pages.settings.subHappVisualBuilder')}
                   </Button>
                 </SettingListItem>
@@ -180,7 +182,7 @@ export default function HappSettingsContent({
           {
             key: 'appearance',
             label: catTabLabel(
-              <DesktopOutlined />,
+              <DesktopOutlined aria-hidden />,
               t('pages.settings.subHappGroupThemes'),
               isMobile,
             ),
@@ -282,6 +284,7 @@ export default function HappSettingsContent({
                 >
                   <Space orientation="vertical" style={{ width: '100%' }}>
                     <Input
+                      aria-label={t('pages.settings.subHappColorProfile')}
                       value={allSetting.subHappColorProfile}
                       placeholder='{"serverRowBackgroundColor":"#21003D67"} or resetcolors'
                       onChange={(e) => updateSetting({ subHappColorProfile: e.target.value })}
@@ -324,7 +327,7 @@ export default function HappSettingsContent({
           {
             key: 'network',
             label: catTabLabel(
-              <ThunderboltOutlined />,
+              <ThunderboltOutlined aria-hidden />,
               t('pages.settings.subHappGroupNetwork'),
               isMobile,
             ),
@@ -491,7 +494,7 @@ export default function HappSettingsContent({
           {
             key: 'failover',
             label: catTabLabel(
-              <CloudSyncOutlined />,
+              <CloudSyncOutlined aria-hidden />,
               t('pages.settings.subHappGroupFailover'),
               isMobile,
             ),

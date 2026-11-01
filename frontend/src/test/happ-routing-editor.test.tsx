@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { describe, expect, it, vi } from 'vitest';
-import { act, fireEvent, screen, within } from '@testing-library/react';
+import { describe, expect, it, vi, afterEach } from 'vitest';
+import { act, cleanup, fireEvent, screen, within } from '@testing-library/react';
 import { EditorView } from 'codemirror';
 
 import { AllSetting } from '@/models/setting';
@@ -39,6 +39,13 @@ function routingLink(value: Record<string, unknown>, mode = 'onadd') {
   return `happ://routing/${mode}/${toBase64Utf8(JSON.stringify(value))}`;
 }
 
+// Unmount while jsdom is alive so CodeMirror destroys its view
+// before the shared cleanup drains pending scheduler callbacks.
+const mounted: Array<() => void> = [];
+afterEach(() => {
+  while (mounted.length) mounted.pop()?.();
+});
+
 function renderSettings(input = routingLink(profile)) {
   const updateSetting = vi.fn<(patch: Partial<AllSetting>) => void>();
 
@@ -60,7 +67,8 @@ function renderSettings(input = routingLink(profile)) {
     );
   }
 
-  renderWithProviders(<SettingsHarness />);
+  const { unmount } = renderWithProviders(<SettingsHarness />);
+  mounted.push(unmount);
   return updateSetting;
 }
 
@@ -318,5 +326,20 @@ describe('Happ routing editor', () => {
     expect(JSON.parse(jsonEditor().state.doc.toString())).toEqual(minimal);
     fireEvent.click(screen.getByRole('button', { name: 'Generate Deeplink' }));
     expect(generatedProfile()).toEqual(minimal);
+  });
+
+  // The static message API outlived the test file and logged act() warnings
+  // after teardown, failing CI with "Closing rpc while onUserConsoleLog was pending".
+  it('takes its toast down with it when unmounted', async () => {
+    renderSettings();
+    openEditor();
+    fireEvent.click(screen.getByRole('button', { name: 'Generate Deeplink' }));
+    await screen.findByText('Deeplink generated and applied to routing rules');
+
+    cleanup();
+
+    expect(document.body.textContent).not.toContain(
+      'Deeplink generated and applied to routing rules',
+    );
   });
 });

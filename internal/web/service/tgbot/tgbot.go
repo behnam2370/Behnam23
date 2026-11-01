@@ -4,7 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"embed"
+	"fmt"
+	"html"
 	"math/big"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -29,6 +32,9 @@ import (
 
 var (
 	bot *telego.Bot
+	// botMu guards bot: EnsureBot may replace it while a background goroutine
+	// (the screen artwork warm-up) is still using the previous liveBot().
+	botMu sync.RWMutex
 
 	// botCancel stores the function to cancel the context, stopping Long Polling gracefully.
 	botCancel context.CancelFunc
@@ -39,6 +45,7 @@ var (
 
 	botHandler  *th.BotHandler
 	adminIds    []int64
+	adminTopics map[int64]int // admin chat -> forum topic (message_thread_id)
 	isRunning   bool
 	hostname    string
 	hashStorage *global.HashStorage
@@ -62,6 +69,13 @@ var (
 		mutex     sync.RWMutex
 	}
 )
+
+// liveBot is the current connection, or nil before login and after logout.
+func liveBot() *telego.Bot {
+	botMu.RLock()
+	defer botMu.RUnlock()
+	return bot
+}
 
 // clientDraft is one chat's add-client wizard state. Per-protocol secrets are
 // filled per-inbound on submit, so only the universal fields live here.
@@ -236,9 +250,19 @@ func (t *Tgbot) NewTgbot() *Tgbot {
 	return new(Tgbot)
 }
 
-// I18nBot retrieves a localized message for the bot interface.
+// I18nBot retrieves a localized message for the bot interface. Every message is sent
+// HTML-parsed, so param values (remarks, e-mails, errors) are escaped here.
 func (t *Tgbot) I18nBot(name string, params ...string) string {
-	return locale.I18n(locale.Bot, name, params...)
+	escaped := make([]string, len(params))
+	for i, param := range params {
+		key, value, found := strings.Cut(param, "==")
+		if !found {
+			escaped[i] = param
+			continue
+		}
+		escaped[i] = key + "==" + html.EscapeString(value)
+	}
+	return locale.I18n(locale.Bot, name, escaped...)
 }
 
 // GetHashStorage returns the hash storage instance for callback queries.
@@ -320,35 +344,20 @@ func (t *Tgbot) Start(i18nFS embed.FS) error {
 		return err
 	}
 
-	parsedAdminIds := make([]int64, 0)
-	// Parse admin IDs from comma-separated string
-	if tgBotID != "" {
-		for adminID := range strings.SplitSeq(tgBotID, ",") {
-			id, err := strconv.ParseInt(adminID, 10, 64)
-			if err != nil {
-				logger.Warning("Failed to parse admin ID from Telegram bot chat ID:", err)
-				return err
-			}
-			parsedAdminIds = append(parsedAdminIds, id)
-		}
+	parsedAdminIds, parsedAdminTopics, err := parseAdminChats(tgBotID)
+	if err != nil {
+		logger.Warning("Failed to parse admin ID from Telegram bot chat ID:", err)
+		return err
 	}
 	tgBotMutex.Lock()
 	adminIds = parsedAdminIds
+	adminTopics = parsedAdminTopics
 	tgBotMutex.Unlock()
 
 	// Get Telegram bot proxy URL
 	tgBotProxy, err := t.settingService.GetTgBotProxy()
 	if err != nil {
 		logger.Warning("Failed to get Telegram bot proxy URL:", err)
-	}
-
-	// Fall back to the panel-wide egress bridge when no dedicated bot proxy is
-	// set. Resolved once at bot start: if Xray comes up later, the bot keeps
-	// its direct connection until it is restarted.
-	if tgBotProxy == "" {
-		if egress := t.settingService.PanelEgressProxyURL(); egress != "" && isSupportedBotProxyScheme(egress) {
-			tgBotProxy = egress
-		}
 	}
 
 	// Get Telegram bot API server URL
@@ -358,13 +367,16 @@ func (t *Tgbot) Start(i18nFS embed.FS) error {
 	}
 
 	// Create new Telegram bot instance
+	botMu.Lock()
 	bot, err = t.NewBot(tgBotToken, tgBotProxy, tgBotAPIServer)
+	botMu.Unlock()
 	if err != nil {
 		logger.Error("Failed to initialize Telegram bot API:", err)
 		return err
 	}
 
-	t.trySetBotCommands(bot)
+	t.resolveScreenArt()
+	t.trySetBotCommands(liveBot())
 
 	// Start receiving Telegram bot messages
 	tgBotMutex.Lock()
@@ -385,17 +397,11 @@ func (t *Tgbot) trySetBotCommands(bot *telego.Bot) {
 		}
 	}()
 
+	// Only /start is advertised: the rest of the actions live on buttons, and
+	// the old list merely duplicated the menu. The commands still work.
 	err := bot.SetMyCommands(context.Background(), &telego.SetMyCommandsParams{
 		Commands: []telego.BotCommand{
 			{Command: "start", Description: t.I18nBot("tgbot.commands.startDesc")},
-			{Command: "help", Description: t.I18nBot("tgbot.commands.helpDesc")},
-			{Command: "status", Description: t.I18nBot("tgbot.commands.statusDesc")},
-			{Command: "id", Description: t.I18nBot("tgbot.commands.idDesc")},
-			{Command: "usage", Description: t.I18nBot("tgbot.commands.usageDesc")},
-			{Command: "inbound", Description: t.I18nBot("tgbot.commands.inboundDesc")},
-			{Command: "restart", Description: t.I18nBot("tgbot.commands.restartDesc")},
-			{Command: "clearall", Description: t.I18nBot("tgbot.commands.clearallDesc")},
-			{Command: "broadcast", Description: t.I18nBot("tgbot.commands.broadcastDesc")},
 		},
 	})
 	if err != nil {
@@ -410,7 +416,7 @@ func isSupportedBotProxyScheme(proxyUrl string) bool {
 }
 
 // createRobustFastHTTPClient creates a fasthttp.Client with proper connection handling
-func (t *Tgbot) createRobustFastHTTPClient(proxyUrl string) *fasthttp.Client {
+func (t *Tgbot) createRobustFastHTTPClient(proxyUrl string, panelEgress func() string) *fasthttp.Client {
 	client := &fasthttp.Client{
 		// Connection timeouts
 		ReadTimeout:                   30 * time.Second,
@@ -437,9 +443,22 @@ func (t *Tgbot) createRobustFastHTTPClient(proxyUrl string) *fasthttp.Client {
 		} else {
 			client.Dial = fasthttpproxy.FasthttpHTTPDialer(proxyUrl)
 		}
+	} else if panelEgress != nil {
+		client.Dial = panelEgressDial(panelEgress)
 	}
 
 	return client
+}
+
+// panelEgressDial resolves the panel egress bridge per connection, so a bridge
+// that comes up after bot start (Xray started later) is used without a restart.
+func panelEgressDial(resolve func() string) fasthttp.DialFunc {
+	return func(addr string) (net.Conn, error) {
+		if bridge := resolve(); bridge != "" {
+			return fasthttpproxy.FasthttpSocksDialer(bridge)(addr)
+		}
+		return fasthttp.Dial(addr)
+	}
 }
 
 // NewBot creates a new Telegram bot instance with optional proxy and API server settings.
@@ -467,7 +486,7 @@ func (t *Tgbot) NewBot(token string, proxyUrl string, apiServerUrl string) (*tel
 	}
 
 	// Create robust fasthttp client
-	client := t.createRobustFastHTTPClient(proxyUrl)
+	client := t.createRobustFastHTTPClient(proxyUrl, t.settingService.PanelEgressProxyURL)
 
 	// Build bot options
 	var options []telego.BotOption
@@ -495,7 +514,62 @@ func adminSnapshot() []int64 {
 	return slices.Clone(adminIds)
 }
 
-// SetHostname sets the hostname for the bot.
+// parseAdminChats reads "chatId[:topicId],..."; the optional topic targets a
+// forum topic in a supergroup, e.g. "123456789,-1001234567890:42".
+func parseAdminChats(raw string) ([]int64, map[int64]int, error) {
+	ids := make([]int64, 0)
+	topics := make(map[int64]int)
+	if strings.TrimSpace(raw) == "" {
+		return ids, topics, nil
+	}
+	for entry := range strings.SplitSeq(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		chatPart, topicPart, hasTopic := strings.Cut(entry, ":")
+		id, err := strconv.ParseInt(strings.TrimSpace(chatPart), 10, 64)
+		if err != nil {
+			return nil, nil, err
+		}
+		topic := 0
+		if hasTopic {
+			topic, err = strconv.Atoi(strings.TrimSpace(topicPart))
+			if err != nil {
+				return nil, nil, err
+			}
+			if topic <= 0 {
+				return nil, nil, fmt.Errorf("invalid topic ID %q for chat %d", topicPart, id)
+			}
+		}
+		// General is thread 1 internally, but the Bot API only reaches it with no thread id.
+		if hasTopic && topic != generalTopicID {
+			if prev, ok := topics[id]; ok && prev != topic {
+				return nil, nil, fmt.Errorf("chat %d has more than one topic configured", id)
+			}
+			topics[id] = topic
+		}
+		if !slices.Contains(ids, id) {
+			ids = append(ids, id)
+		}
+	}
+	return ids, topics, nil
+}
+
+const generalTopicID = 1
+
+// adminTopic returns the forum topic configured for chatId, or 0 when the
+// chat has none and messages should go to the chat itself.
+func adminTopic(chatId int64) int {
+	tgBotMutex.Lock()
+	defer tgBotMutex.Unlock()
+	return adminTopics[chatId]
+}
+
+// inAdminTopic routes a document to the configured forum topic of its chat.
+func inAdminTopic(document *telego.SendDocumentParams) *telego.SendDocumentParams {
+	document.MessageThreadID = adminTopic(document.ChatID.ID)
+	return document
+}
+
+// SetHostname sets the hostname for the liveBot().
 func (t *Tgbot) SetHostname() {
 	host, err := os.Hostname()
 	if err != nil {
@@ -513,6 +587,7 @@ func (t *Tgbot) Stop() {
 	logger.Info("Stop Telegram receiver ...")
 	tgBotMutex.Lock()
 	adminIds = nil
+	adminTopics = nil
 	tgBotMutex.Unlock()
 }
 
@@ -537,7 +612,7 @@ func StopBot() {
 	}
 
 	if cancel != nil {
-		logger.Info("Sending cancellation signal to Telegram bot...")
+		logger.Info("Sending cancellation signal to Telegram liveBot()...")
 		// Cancels the context passed to UpdatesViaLongPolling; this closes updates channel
 		// and lets botHandler.Start() exit cleanly.
 		cancel()
@@ -579,11 +654,6 @@ func (t *Tgbot) randomLowerAndNum(length int) string {
 		bytes[i] = charset[randomIndex.Int64()]
 	}
 	return string(bytes)
-}
-
-// int64Contains checks if an int64 slice contains a specific item.
-func int64Contains(slice []int64, item int64) bool {
-	return slices.Contains(slice, item)
 }
 
 // isSingleWord checks if the text contains only a single word.

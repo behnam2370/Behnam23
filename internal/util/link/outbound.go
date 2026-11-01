@@ -12,9 +12,12 @@ import (
 	"math"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/mhsanaei/3x-ui/v3/internal/util/maskcompat"
 )
 
 // Outbound is the minimal shape we emit for each parsed link.
@@ -28,6 +31,10 @@ type ParseResult struct {
 	Outbound Outbound
 	Identity string
 }
+
+// MaxSubscriptionOutbounds caps the outbounds one document yields: each is held, validated
+// and merged into the core's config, and the byte cap alone allows hundreds of thousands.
+const MaxSubscriptionOutbounds = 2000
 
 // ParseSubscriptionBody accepts the raw body returned by a subscription URL.
 // It handles the common case where the body is a base64-encoded blob of
@@ -51,6 +58,9 @@ func ParseSubscriptionBody(body []byte) ([]Outbound, []string, error) {
 	seen := map[string]int{}
 
 	for _, ln := range lines {
+		if len(outbounds) >= MaxSubscriptionOutbounds {
+			break
+		}
 		ln = strings.TrimSpace(ln)
 		if ln == "" || strings.HasPrefix(ln, "#") {
 			continue
@@ -116,7 +126,43 @@ func splitLines(s string) []string {
 //   - hysteria2:// (also hy2://)
 //   - wireguard:// (also wg://)
 func ParseLink(link string) (*ParseResult, error) {
-	link = strings.TrimSpace(link)
+	res, err := parseLinkByScheme(strings.TrimSpace(link))
+	if err != nil {
+		return nil, err
+	}
+	dropHostLocalKeys(res.Outbound)
+	if !nestsWithin(map[string]any(res.Outbound), maxOutboundDepth) {
+		return nil, fmt.Errorf("link nests JSON deeper than %d levels", maxOutboundDepth)
+	}
+	return res, nil
+}
+
+// maxOutboundDepth bounds the JSON a link can nest into its outbound (the deepest real shape,
+// an xhttp download stream's finalmask, is about 11): pretty-printing costs depth squared.
+const maxOutboundDepth = 16
+
+func nestsWithin(v any, depth int) bool {
+	if depth < 0 {
+		return false
+	}
+	switch v := v.(type) {
+	case map[string]any:
+		for _, child := range v {
+			if !nestsWithin(child, depth-1) {
+				return false
+			}
+		}
+	case []any:
+		for _, child := range v {
+			if !nestsWithin(child, depth-1) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func parseLinkByScheme(link string) (*ParseResult, error) {
 	switch {
 	case strings.HasPrefix(link, "vmess://"):
 		return parseVmess(link)
@@ -132,6 +178,29 @@ func ParseLink(link string) (*ParseResult, error) {
 		return parseWireguard(link)
 	default:
 		return nil, fmt.Errorf("unsupported link scheme")
+	}
+}
+
+// hostLocalKeys redirect the core's dial or name files on the importing host; extra=, fm= and
+// vmess JSON copy provider keys verbatim, and the core binds keys case-folded.
+var hostLocalKeys = []string{"dialerProxy", "certificateFile", "keyFile", "masterKeyLog"}
+
+func dropHostLocalKeys(v any) {
+	switch v := v.(type) {
+	case map[string]any:
+		for key, child := range v {
+			if slices.ContainsFunc(hostLocalKeys, func(k string) bool { return strings.EqualFold(k, key) }) {
+				delete(v, key)
+				continue
+			}
+			dropHostLocalKeys(child)
+		}
+	case Outbound:
+		dropHostLocalKeys(map[string]any(v))
+	case []any:
+		for _, child := range v {
+			dropHostLocalKeys(child)
+		}
 	}
 }
 
@@ -183,10 +252,16 @@ func parseVmess(link string) (*ParseResult, error) {
 		if m := getString(j, "mode", ""); m != "" {
 			xh["mode"] = m
 		}
-		// xhttp advanced keys are passed through if present in the json
-		for _, k := range []string{"xPaddingBytes", "scMaxEachPostBytes", "scMinPostsIntervalMs"} {
+		for _, k := range vmessXhttpKeys {
 			if v, ok := j[k]; ok {
 				xh[k] = v
+			}
+		}
+		for legacy, renamed := range xhttpLegacyAliases {
+			if _, ok := xh[renamed]; !ok {
+				if v, ok := j[legacy].(string); ok && v != "" {
+					xh[renamed] = v
+				}
 			}
 		}
 	case "tcp":
@@ -203,7 +278,17 @@ func parseVmess(link string) (*ParseResult, error) {
 				},
 			}
 		}
+	case "kcp":
+		applyTransport(stream, url.Values{"mtu": {strconv.Itoa(num(j["mtu"]))}, "tti": {strconv.Itoa(num(j["tti"]))}})
 	}
+
+	// The vmess object carries fm as-is and the mKCP header and seed as type and path.
+	maskParams := url.Values{"fm": {getString(j, "fm", "")}}
+	if network == "kcp" {
+		maskParams.Set("headerType", getString(j, "type", ""))
+		maskParams.Set("seed", getString(j, "path", ""))
+	}
+	applyFinalMask(stream, maskParams)
 
 	if security == "tls" {
 		tls := stream["tlsSettings"].(map[string]any)
@@ -217,6 +302,7 @@ func parseVmess(link string) (*ParseResult, error) {
 		tls["echConfigList"] = getString(j, "ech", "")
 		tls["verifyPeerCertByName"] = getString(j, "vcn", "")
 		tls["pinnedPeerCertSha256"] = getString(j, "pcs", "")
+		tls["cipherSuites"] = getString(j, "cs", "")
 	}
 
 	port := num(j["port"])
@@ -244,6 +330,21 @@ func parseVmess(link string) (*ParseResult, error) {
 		"streamSettings": stream,
 	}
 	return &ParseResult{Outbound: ob, Identity: identity}, nil
+}
+
+// vmessXhttpKeys are the XHTTP fields a vmess link carries inline, where vless/trojan put them in extra.
+var vmessXhttpKeys = []string{
+	"xPaddingBytes", "xPaddingObfsMode", "xPaddingKey", "xPaddingHeader", "xPaddingPlacement", "xPaddingMethod",
+	"sessionIDPlacement", "sessionIDKey", "sessionIDTable", "sessionIDLength",
+	"seqPlacement", "seqKey", "uplinkDataPlacement", "uplinkDataKey", "uplinkHTTPMethod", "uplinkChunkSize",
+	"scMaxEachPostBytes", "scMinPostsIntervalMs", "scMaxBufferedPosts", "scStreamUpServerSecs",
+	"serverMaxHeaderBytes", "noSSEHeader", "noGRPCHeader", "xmux", "downloadSettings", "headers",
+}
+
+// xhttpLegacyAliases maps the pre-rename session keys older links carry onto the current ones.
+var xhttpLegacyAliases = map[string]string{
+	"sessionPlacement": "sessionIDPlacement",
+	"sessionKey":       "sessionIDKey",
 }
 
 func vmessIdentity(j map[string]any) string {
@@ -654,6 +755,7 @@ func buildStream(network, security string) map[string]any {
 		stream["tlsSettings"] = map[string]any{
 			"serverName": "", "alpn": []any{}, "fingerprint": "",
 			"echConfigList": "", "verifyPeerCertByName": "", "pinnedPeerCertSha256": "",
+			"cipherSuites": "",
 		}
 	case "reality":
 		stream["realitySettings"] = map[string]any{
@@ -750,6 +852,9 @@ func applySecurity(stream map[string]any, p url.Values) {
 		tls["echConfigList"] = p.Get("ech")
 		tls["verifyPeerCertByName"] = p.Get("vcn")
 		tls["pinnedPeerCertSha256"] = p.Get("pcs")
+		if cs := p.Get("cs"); cs != "" {
+			tls["cipherSuites"] = cs
+		}
 	case "reality":
 		re := stream["realitySettings"].(map[string]any)
 		re["serverName"] = p.Get("sni")
@@ -766,6 +871,9 @@ func applyFinalMask(stream map[string]any, p url.Values) {
 		var parsed any
 		if json.Unmarshal([]byte(fm), &parsed) == nil {
 			sanitizeFinalMaskQuicParams(parsed)
+			maskcompat.UpgradeLegacyXdns(parsed)
+			maskcompat.UpgradeLegacyUDPHop(parsed)
+			maskcompat.NormalizeUDPHop(parsed)
 			stream["finalmask"] = parsed
 		}
 	}
@@ -1175,6 +1283,8 @@ func base64DecodeFlexible(s string) (string, error) {
 // replacing every other run of characters with a single dash.
 var slugRe = regexp.MustCompile(`[^\p{L}\p{N}]+`)
 
+const maxSlugRunes = 64
+
 func SlugRemark(remark string) string {
 	s := strings.ToLower(strings.TrimSpace(remark))
 	s = slugRe.ReplaceAllString(s, "-")
@@ -1185,6 +1295,10 @@ func SlugRemark(remark string) string {
 	// collapse runs of dashes
 	for strings.Contains(s, "--") {
 		s = strings.ReplaceAll(s, "--", "-")
+	}
+	// The tag names Xray counters, a traffic row and the config; a link author picks the remark.
+	if r := []rune(s); len(r) > maxSlugRunes {
+		s = strings.TrimRight(string(r[:maxSlugRunes]), "-")
 	}
 	return s
 }

@@ -75,6 +75,13 @@ func TestInboundTransports(t *testing.T) {
 		{"hysteria forced udp", model.Hysteria, `{"network":"tcp"}`, ``, transportUDP},
 		{"wireguard forced udp", model.WireGuard, ``, ``, transportUDP},
 
+		// MASQUE serves HTTP/3 on UDP unless the TLS ALPN offers only h2, and adds an
+		// HTTP/2 listener on TCP whenever h2 is offered.
+		{"masque without alpn is udp", model.MASQUE, `{"network":"masque","tlsSettings":{}}`, ``, transportUDP},
+		{"masque h3 is udp", model.MASQUE, `{"network":"masque","tlsSettings":{"alpn":["h3"]}}`, ``, transportUDP},
+		{"masque h2 is tcp", model.MASQUE, `{"network":"masque","tlsSettings":{"alpn":["h2"]}}`, ``, transportTCP},
+		{"masque h3+h2 is both", model.MASQUE, `{"network":"masque","tlsSettings":{"alpn":["h3","h2"]}}`, ``, transportTCP | transportUDP},
+
 		{"shadowsocks tcp,udp", model.Shadowsocks, ``, `{"network":"tcp,udp"}`, transportTCP | transportUDP},
 		{"shadowsocks udp only", model.Shadowsocks, ``, `{"network":"udp"}`, transportUDP},
 		{"shadowsocks tcp only", model.Shadowsocks, ``, `{"network":"tcp"}`, transportTCP},
@@ -806,6 +813,41 @@ func TestCheckPortConflict_AmneziawgnetSocksRelayBlockedLocal(t *testing.T) {
 	}
 	if msg := got.String(); !strings.Contains(msg, "awg-1") {
 		t.Fatalf("conflict message should name the owning AmneziaWG inbound; got %q", msg)
+	}
+}
+
+func TestCheckPortConflict_KernelAmneziaWGDoesNotReserveEmbeddedRelay(t *testing.T) {
+	setupConflictDB(t)
+	seedInboundConflict(t, "awg-kernel", "0.0.0.0", 51820, model.AmneziaWG, ``,
+		`{"server":{"privateKey":"priv","publicKey":"pub","subnetIp":"10.8.1.0","subnetCidr":24,"kernelMode":true},"clients":[]}`)
+
+	var awgInbound model.Inbound
+	if err := database.GetDB().Where("tag = ?", "awg-kernel").First(&awgInbound).Error; err != nil {
+		t.Fatalf("read seeded row: %v", err)
+	}
+	candidate := &model.Inbound{
+		Tag:      "vless-kernel-relay-port",
+		Listen:   "0.0.0.0",
+		Port:     amneziawgnet.SOCKSPortForInbound(awgInbound.Id),
+		Protocol: model.VLESS,
+	}
+	if got, err := (&InboundService{}).checkPortConflict(candidate, 0); err != nil || got != nil {
+		t.Fatalf("kernel-mode AmneziaWG must not reserve an embedded relay port, including with no peers; got=%v err=%v", got, err)
+	}
+}
+
+func TestCheckPortConflict_KernelAmneziaWGAllowsItsUDPPortToMatchRelayRange(t *testing.T) {
+	setupConflictDB(t)
+	seedInboundConflict(t, "awg-kernel", "0.0.0.0", 51820, model.AmneziaWG, ``,
+		`{"server":{"privateKey":"priv","publicKey":"pub","subnetIp":"10.8.1.0","subnetCidr":24,"kernelMode":true},"clients":[]}`)
+
+	var awgInbound model.Inbound
+	if err := database.GetDB().Where("tag = ?", "awg-kernel").First(&awgInbound).Error; err != nil {
+		t.Fatalf("read seeded row: %v", err)
+	}
+	awgInbound.Port = amneziawgnet.SOCKSPortForInbound(awgInbound.Id)
+	if got, err := (&InboundService{}).checkPortConflict(&awgInbound, awgInbound.Id); err != nil || got != nil {
+		t.Fatalf("kernel-mode AmneziaWG UDP port may use a port in the embedded TCP relay range; got=%v err=%v", got, err)
 	}
 }
 
